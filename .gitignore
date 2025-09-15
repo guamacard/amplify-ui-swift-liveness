@@ -3,6 +3,7 @@
 /.index-build
 /Packages
 /*.xcodeproj
+Package.resolved
 xcuserdata/
 DerivedData/
 .swiftpm/config/registries.json
