@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name         = 'AmplifyUILiveness'
-  s.version      = '1.0.0'
+  s.version      = '1.1.0'
   s.summary      = 'AWS Amplify UI Liveness module'
   s.homepage     = 'https://github.com/aws-amplify/amplify-ui-swift-liveness'
   s.license      = { :type => 'Apache 2.0', :file => 'LICENSE' }
