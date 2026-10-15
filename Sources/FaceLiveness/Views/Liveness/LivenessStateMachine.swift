@@ -32,11 +32,10 @@ struct LivenessStateMachine {
         case .tooFar(_, let nearnessPercentage):
             reason = .moveFaceCloser
             percentage = nearnessPercentage
-        case .tooFarLeft(_, let nearnessPercentage):
-            reason = .moveFaceLeft
-            percentage = nearnessPercentage
-        case .tooFarRight(_, let nearnessPercentage):
-            reason = .moveFaceRight
+        // A face off to either side of the oval is told to move closer.
+        case .tooFarLeft(_, let nearnessPercentage),
+                .tooFarRight(_, let nearnessPercentage):
+            reason = .moveFaceCloser
             percentage = nearnessPercentage
         case .tooClose(_, let nearnessPercentage):
             reason = .faceTooClose
@@ -45,6 +44,19 @@ struct LivenessStateMachine {
         }
 
         state = .awaitingFaceInOvalMatch(reason, percentage)
+    }
+
+    /// Surfaces a `.noFace` / `.multipleFaces` reason while the face is being matched to the
+    /// oval (the oval is displayed, or we're awaiting an oval match), so the on-screen
+    /// instruction stays in sync when the face is lost instead of leaving a stale one. Once the
+    /// face has matched, losing it doesn't change the state: the colors run to the end.
+    mutating func faceNotMatched(reason: FaceNotPreparedReason) {
+        switch state {
+        case .recording(ovalDisplayed: true), .awaitingFaceInOvalMatch:
+            state = .awaitingFaceInOvalMatch(reason, 0)
+        default:
+            break
+        }
     }
 
     mutating func awaitingRecording() {
@@ -74,11 +86,24 @@ struct LivenessStateMachine {
     }
 
     mutating func completedDisplayingFreshness() {
+        guard !hasEnded else { return }
         state = .completedDisplayingFreshness
     }
     
     mutating func completedNoLightCheck() {
+        guard !hasEnded else { return }
         state = .completedNoLightCheck
+    }
+
+    /// Whether the check has completed or failed; a challenge finishing afterwards doesn't
+    /// change that.
+    var hasEnded: Bool {
+        switch state {
+        case .completed, .encounteredUnrecoverableError:
+            return true
+        default:
+            return false
+        }
     }
 
     mutating func displayingFreshness() {
@@ -89,12 +114,26 @@ struct LivenessStateMachine {
         state = .completed
     }
 
-    var shouldDisplayRecordingIcon: Bool {
+    /// Whether the face guide (the white overlay with the oval cut out) is on screen: from when
+    /// the oval is displayed through the freshness (color) check. It's removed once the check
+    /// completes, before "Verifying".
+    var isFaceGuideDisplayed: Bool {
         switch state {
-        case .initial, .pendingFacePreparedConfirmation, .encounteredUnrecoverableError:
+        case .recording(ovalDisplayed: true),
+             .awaitingFaceInOvalMatch,
+             .faceMatched,
+             .displayingFreshness:
+            return true
+        default:
             return false
-        default: return true
         }
+    }
+
+    var shouldDisplayRecordingIcon: Bool {
+        // The session is capturing exactly while the face guide is up. Everything else,
+        // including `.waitForRecording` (before the oval) and the post-challenge verifying
+        // states, isn't, so the icon stays hidden.
+        isFaceGuideDisplayed
     }
 
     enum State: Equatable {
@@ -180,4 +219,8 @@ extension URLSessionWebSocketTask.CloseCode {
     static let viewClosure = URLSessionWebSocketTask.CloseCode(rawValue: 4004)
     static let unexpectedRuntimeError = URLSessionWebSocketTask.CloseCode(rawValue: 4005)
     static let missingVideoPermission = URLSessionWebSocketTask.CloseCode(rawValue: 4006)
+    
+    func isKnownLivenessError() -> Bool {
+        return (4001...4006).contains(self.rawValue)
+    }
 }
