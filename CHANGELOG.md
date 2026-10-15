@@ -1,5 +1,75 @@
 # Changelog
 
+## 1.5.2 (2026-10-15)
+
+### Bug Fixes
+
+- don't restart the light challenge colors when the face is lost (#273)
+
+## 1.5.1 (2026-10-12)
+
+### Bug Fixes
+
+- keep the screen awake during the liveness check (#269)
+- start the check straight away, without restarting the camera (#267)
+
+## 1.5.0 (2026-10-07)
+
+### Features
+
+- add options to hide or replace the close button (#262)
+- add FaceLivenessDetectorTheme for customizing colors and fonts (#260)
+
+### Bug Fixes
+
+- align the light challenge video with the timestamps sent to the service (#265)
+- match Android's liveness check layout (#259)
+
+## 1.4.10 (2026-10-01)
+
+### Bug Fixes
+
+- show face distance hints on every frame, matching Android (#257)
+
+## 1.4.9 (2026-09-24)
+
+### Bug Fixes
+
+- Re-export credential protocols for import FaceLiveness (#253)
+
+## 1.4.8 (2026-09-22)
+
+### Bug Fixes
+
+- correct preview geometry on resized windows and gate non-portrait use (#246)
+
+## 1.4.7 (2026-09-09)
+
+## 1.4.6 (2026-09-02)
+
+### Bug Fixes
+
+- handle face loss during active check, correct REC indicator visibility, and distinguish interrupted sessions (#240)
+- restore brightness after liveness check (#236)
+
+## 1.4.5 (2026-07-27)
+
+### Bug Fixes
+
+- update amplify dependency for url signing fix (#231)
+
+## 1.4.4 (2025-11-10)
+
+### Bug Fixes
+
+- capture weak self reference in dispatchqueue execute blocks (#220)
+
+## 1.4.3 (2025-10-13)
+
+### Bug Fixes
+
+- avoid invoking onCompletion handler twice for non-service errors (#214)
+
 ## 1.4.2 (2025-07-17)
 
 ## 1.4.1 (2025-07-01)

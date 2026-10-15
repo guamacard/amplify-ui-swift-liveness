@@ -32,14 +32,25 @@ class FaceLivenessDetectionViewModel: ObservableObject {
     let isPreviewScreenEnabled : Bool
     var colorSequences: [ColorSequence] = []
     var hasSentFinalVideoEvent = false
+    private var hasFinishedVideo = false
     var hasSentFirstVideo = false
     var layerRectConverted: (CGRect) -> CGRect = { $0 }
     var sessionConfiguration: FaceLivenessSession.SessionConfiguration?
     var challengeReceived: Challenge?
     var normalizeFace: (DetectedFace) -> DetectedFace = { $0 }
     var provideSingleFrame: ((UIImage) -> Void)?
-    var cameraViewRect = CGRect.zero
-    var ovalRect = CGRect.zero
+    /// The fitted preview rect and the oval mapped onto it. Written on main by layout, read on
+    /// the capture queue per frame, hence the lock rather than main-actor isolation.
+    nonisolated var cameraViewRect: CGRect {
+        get { cameraViewRectStorage.value }
+        set { cameraViewRectStorage.value = newValue }
+    }
+    nonisolated var ovalRect: CGRect {
+        get { ovalRectStorage.value }
+        set { ovalRectStorage.value = newValue }
+    }
+    private let cameraViewRectStorage = Synchronized(CGRect.zero)
+    private let ovalRectStorage = Synchronized(CGRect.zero)
     var initialClientEvent: InitialClientEvent?
     var faceMatchedTimestamp: UInt64?
     var noFitStartTime: Date?
@@ -49,18 +60,8 @@ class FaceLivenessDetectionViewModel: ObservableObject {
     static var attemptIdTimeStamp: Date = Date()
     
     var noFitTimeoutInterval: TimeInterval {
-        guard let sessionConfiguration = sessionConfiguration else {
-            return defaultNoFitTimeoutInterval
-        }
-        
-        let ovalMatchChallenge: FaceLivenessSession.OvalMatchChallenge
-        switch sessionConfiguration{
-        case .faceMovement(let challenge):
-            ovalMatchChallenge = challenge
-        case .faceMovementAndLight(_, let challenge):
-            ovalMatchChallenge = challenge
-        }
-        
+        guard let ovalMatchChallenge else { return defaultNoFitTimeoutInterval }
+
         let sessionTimeoutMilliSec = ovalMatchChallenge.oval.ovalFitTimeout
         return TimeInterval(sessionTimeoutMilliSec/1_000)
     }
@@ -85,10 +86,8 @@ class FaceLivenessDetectionViewModel: ObservableObject {
         self.challengeOptions = challengeOptions
 
         self.closeButtonAction = { [weak self] in
-            guard let self else { return }
             DispatchQueue.main.async {
-                self.stopRecording()
-                self.livenessState.unrecoverableStateEncountered(.userCancelled)
+                self?.endCheck(with: .userCancelled)
             }
         }
 
@@ -115,10 +114,12 @@ class FaceLivenessDetectionViewModel: ObservableObject {
                 DispatchQueue.main.async {
                     self?.livenessState.complete()
                 }
-            case .unexpectedClosure:
+            case .unexpectedClosure(let error):
                 DispatchQueue.main.async {
-                    self?.livenessState
-                        .unrecoverableStateEncountered(.socketClosed)
+                    // known liveness/rekognition service exceptions set the `livenessState` and
+                    // invoke onCompletion() callback directly
+                    guard !error.isKnownLivenessError() else { return }
+                    self?.livenessState.unrecoverableStateEncountered(.socketClosed)
                 }
             }
         })
@@ -141,9 +142,9 @@ class FaceLivenessDetectionViewModel: ObservableObject {
 
     @objc func willResignActive(_ notification: Notification) {
         guard self.livenessState.state != .initial else { return }
-        DispatchQueue.main.async {
-            self.stopRecording()
-            self.livenessState.unrecoverableStateEncountered(.viewResignation)
+        DispatchQueue.main.async { [weak self] in
+            self?.stopRecording()
+            self?.livenessState.unrecoverableStateEncountered(.viewResignation)
         }
     }
 
@@ -155,15 +156,30 @@ class FaceLivenessDetectionViewModel: ObservableObject {
         captureSession?.stopRunning()
     }
 
+    /// Ends the check with `error` unless it has already finished, so the terminal state is
+    /// published once however many exits (close, cancel, rotation, deactivation) race for it.
+    func endCheck(with error: LivenessStateMachine.LivenessError) {
+        switch livenessState.state {
+        case .completed, .encounteredUnrecoverableError:
+            return
+        default:
+            break
+        }
+
+        stopRecording()
+        livenessState.unrecoverableStateEncountered(error)
+    }
+
     func configureCamera(withinFrame frame: CGRect) -> CALayer? {
         do {
             let avLayer = try captureSession?.configureCamera(frame: frame)
-            DispatchQueue.main.async {
-                self.livenessState.checkIsFacePrepared()
+            DispatchQueue.main.async { [weak self] in
+                self?.livenessState.checkIsFacePrepared()
             }
             return avLayer
         } catch {
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
                 self.livenessState.unrecoverableStateEncountered(
                     self.generateLivenessError(from: error)
                 )
@@ -174,40 +190,64 @@ class FaceLivenessDetectionViewModel: ObservableObject {
 
     func drawOval(onComplete: @escaping () -> Void) {
         guard livenessState.state == .recording(ovalDisplayed: false),
-              let sessionConfiguration = sessionConfiguration else { return }
-        
-        let ovalMatchChallenge: FaceLivenessSession.OvalMatchChallenge
-        switch sessionConfiguration {
-        case .faceMovement(let challenge):
-            ovalMatchChallenge = challenge
-        case .faceMovementAndLight(_, let challenge):
-            ovalMatchChallenge = challenge
-        }
-        
-        let ovalParameters = ovalMatchChallenge.oval
-        let scaleRatio = cameraViewRect.width / videoSize.width
-        let rect = CGRect(
-            x: ovalParameters.boundingBox.x,
-            y: ovalParameters.boundingBox.y,
-            width: ovalParameters.boundingBox.width,
-            height: ovalParameters.boundingBox.height
-        )
+              let ovalMatchChallenge = ovalMatchChallenge else { return }
 
-        let normalizedOvalRect = CGRect(
-            x: rect.minX * scaleRatio,
-            y: rect.minY * scaleRatio,
-            width: rect.width * scaleRatio,
-            height: rect.height * scaleRatio
-        )
+        // an oval mapped through an empty rect would mask the whole preview; the next
+        // detection retries once layout supplies a real rect
+        guard !cameraViewRect.isEmpty else { return }
+
+        let normalizedOvalRect = computeOvalRect(for: ovalMatchChallenge)
 
         livenessViewControllerDelegate?.drawOvalInCanvas(normalizedOvalRect)
-        DispatchQueue.main.async {
-            self.livenessState.ovalDisplayed()
+        DispatchQueue.main.async { [weak self] in
+            self?.livenessState.ovalDisplayed()
             onComplete()
         }
         ovalRect = normalizedOvalRect
     }
 
+    /// Recomputes and redraws the oval for the current `cameraViewRect` after a resize, without
+    /// touching the state machine. Only runs while an oval is on screen.
+    func redrawOvalForCurrentCameraViewRect() {
+        guard livenessState.isFaceGuideDisplayed else { return }
+
+        // keep the oval that is on screen until a layout pass supplies real geometry
+        guard !cameraViewRect.isEmpty,
+              let ovalMatchChallenge = ovalMatchChallenge else { return }
+
+        let normalizedOvalRect = computeOvalRect(for: ovalMatchChallenge)
+        guard normalizedOvalRect != ovalRect else { return }
+
+        ovalRect = normalizedOvalRect
+        livenessViewControllerDelegate?.drawOvalInCanvas(normalizedOvalRect)
+    }
+
+    private func computeOvalRect(
+        for ovalMatchChallenge: FaceLivenessSession.OvalMatchChallenge
+    ) -> CGRect {
+        let boundingBox = ovalMatchChallenge.oval.boundingBox
+        return LivenessPreviewGeometry.ovalRect(
+            forVideoOval: CGRect(
+                x: boundingBox.x,
+                y: boundingBox.y,
+                width: boundingBox.width,
+                height: boundingBox.height
+            ),
+            videoSize: videoSize,
+            previewWidth: cameraViewRect.width
+        )
+    }
+
+    private var ovalMatchChallenge: FaceLivenessSession.OvalMatchChallenge? {
+        guard let sessionConfiguration = sessionConfiguration else { return nil }
+
+        switch sessionConfiguration {
+        case .faceMovement(let challenge):
+            return challenge
+        case .faceMovementAndLight(_, let challenge):
+            return challenge
+        }
+    }
 
     func initializeLivenessStream() {
         do {
@@ -228,8 +268,8 @@ class FaceLivenessDetectionViewModel: ObservableObject {
                     preCheckViewEnabled: isPreviewScreenEnabled)
             )
         } catch {
-            DispatchQueue.main.async {
-                self.livenessState.unrecoverableStateEncountered(.couldNotOpenStream)
+            DispatchQueue.main.async { [weak self] in
+                self?.livenessState.unrecoverableStateEncountered(.couldNotOpenStream)
             }
         }
     }
@@ -251,8 +291,8 @@ class FaceLivenessDetectionViewModel: ObservableObject {
                 eventDate: { .init() }
             )
         } catch {
-            DispatchQueue.main.async {
-                self.livenessState.unrecoverableStateEncountered(.unknown)
+            DispatchQueue.main.async { [weak self] in
+                self?.livenessState.unrecoverableStateEncountered(.unknown)
             }
         }
     }
@@ -266,14 +306,14 @@ class FaceLivenessDetectionViewModel: ObservableObject {
         )
     }
 
-    func sendInitialFaceDetectedEvent(
-        initialFace: CGRect,
-        videoStartTime: UInt64
-    ) {
+    func sendInitialFaceDetectedEvent(initialFace: CGRect) {
         guard initialClientEvent == nil else { return }
         guard let challengeReceived else { return }
         
         videoChunker.start()
+        // after `start()`, which waits for the writer if it's still starting, so this is the time
+        // of the video's first frame
+        let videoStartTime = Date().timestampMilliseconds
 
         let initialFace = FaceDetection(
             boundingBox: boundingBox(for: initialFace, relativeTo: cameraViewRect),
@@ -295,72 +335,88 @@ class FaceLivenessDetectionViewModel: ObservableObject {
                 eventDate: { .init() }
             )
         } catch {
-            DispatchQueue.main.async {
-                self.livenessState.unrecoverableStateEncountered(.unknown)
+            DispatchQueue.main.async { [weak self] in
+                self?.livenessState.unrecoverableStateEncountered(.unknown)
             }
         }
     }
 
-    func sendFinalEvent(
-        viewSize: CGSize,
-        faceMatchedEnd: UInt64
-    ) {
+    /// Returns a closure that sends the final event, then the empty video event that closes the
+    /// stream. The event is built from the view model now, on the main actor, as recording
+    /// stops; the closure doesn't touch the view model, so the writer can call it on its own
+    /// queue straight after the last segment, rather than it waiting its turn on the main thread.
+    private func finalEventSender(challengeEnd: UInt64) -> @Sendable () -> Void {
         guard
+            let livenessService,
             let sessionConfiguration,
             let initialClientEvent,
             let faceMatchedTimestamp,
             let challengeReceived
-        else { return }
+        else { return {} }
 
         let finalClientEvent = FinalClientEvent(
             sessionConfiguration: sessionConfiguration,
             initialClientEvent: initialClientEvent,
             videoSize: videoSize,
             faceMatchedStart: faceMatchedTimestamp,
-            faceMatchedEnd: faceMatchedEnd,
-            videoEnd: Date().timestampMilliseconds
+            faceMatchedEnd: challengeEnd,
+            videoEnd: challengeEnd
         )
 
-        do {
-            try livenessService?.send(
-                .final(event: finalClientEvent,
-                       challenge: challengeReceived),
-                eventDate: { .init() }
-            )
+        return { [weak self] in
+            do {
+                try livenessService.send(
+                    .final(event: finalClientEvent,
+                           challenge: challengeReceived),
+                    eventDate: { .init() }
+                )
 
-            sendVideoEvent(
-                data: .init(),
-                videoEventTime: Date().timestampMilliseconds
-            )
-            hasSentFinalVideoEvent = true
-
-        } catch {
-            DispatchQueue.main.async {
-                self.livenessState.unrecoverableStateEncountered(.unknown)
+                let endOfVideoDate = Date()
+                try livenessService.send(
+                    .video(event: .init(chunk: .init(), timestamp: endOfVideoDate.timestampMilliseconds)),
+                    eventDate: { endOfVideoDate }
+                )
+                DispatchQueue.main.async {
+                    self?.hasSentFinalVideoEvent = true
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.livenessState.unrecoverableStateEncountered(.unknown)
+                }
             }
         }
     }
 
-    func sendFinalVideoEvent() {
-        sendFinalEvent(
-            viewSize: videoSize,
-            faceMatchedEnd: Date().timestampMilliseconds
-        )
+    /// Ends the video as soon as the challenge is over, then sends the final event. The writer
+    /// delivers the partial last segment before it finishes, so the final event follows all of
+    /// the video and reports when the challenge ended as the end of the face match.
+    func finishVideo() {
+        // a check that was cancelled or failed in the meantime has nothing more to send
+        guard !hasFinishedVideo, !livenessState.hasEnded else { return }
+        hasFinishedVideo = true
 
-        videoChunker.finish { [weak livenessViewControllerDelegate] image in
-            livenessViewControllerDelegate?.displaySingleFrame(uiImage: image)
-        }
+        videoChunker.finish(
+            singleFrame: { [weak livenessViewControllerDelegate] image in
+                livenessViewControllerDelegate?.displaySingleFrame(uiImage: image)
+            },
+            onFinished: finalEventSender(challengeEnd: Date().timestampMilliseconds)
+        )
     }
 
     func handleFreshnessComplete() {
-        DispatchQueue.main.async {
-            self.livenessState.completedDisplayingFreshness()
+        DispatchQueue.main.async { [weak self] in
+            self?.livenessState.completedDisplayingFreshness()
         }
+        finishVideo()
     }
     
     func completeNoLightCheck() {
-        DispatchQueue.main.async {
-            self.livenessState.completedNoLightCheck()
+        // keep recording the matched face for a second, as the light challenge does before its
+        // colors start, so the face match sent to the service doesn't end the moment it begins.
+        // The face guide stays up until then, so the user holds still for it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.livenessState.completedNoLightCheck()
+            self?.finishVideo()
         }
     }
 
@@ -377,8 +433,8 @@ class FaceLivenessDetectionViewModel: ObservableObject {
                 eventDate: { eventDate }
             )
         } catch {
-            DispatchQueue.main.async {
-                self.livenessState.unrecoverableStateEncountered(.unknown)
+            DispatchQueue.main.async { [weak self] in
+                self?.livenessState.unrecoverableStateEncountered(.unknown)
             }
         }
     }
@@ -416,13 +472,7 @@ class FaceLivenessDetectionViewModel: ObservableObject {
     }
     
     func configureCaptureSession(challenge: Challenge) {
-        let cameraPosition: LivenessCamera
-        switch challenge {
-        case .faceMovementChallenge:
-            cameraPosition = challengeOptions.faceMovementChallengeOption.camera
-        case .faceMovementAndLightChallenge:
-            cameraPosition = challengeOptions.faceMovementAndLightChallengeOption.camera
-        }
+        let cameraPosition = challengeOptions.camera(for: challenge)
         
         let avCaptureDevice = AVCaptureDevice.default(
                                 .builtInWideAngleCamera,
@@ -436,6 +486,9 @@ class FaceLivenessDetectionViewModel: ObservableObject {
                 videoChunker: self.videoChunker
             )
         )
+        // the oval now comes up as soon as the face is in range, which can be sooner after the
+        // camera starts than the writer takes to start, so start it as soon as the challenge is known
+        videoChunker.prepare()
     }
 }
 

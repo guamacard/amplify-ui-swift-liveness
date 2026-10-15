@@ -15,17 +15,9 @@ extension FaceLivenessDetectionViewModel: FaceDetectionResultHandler {
     func process(newResult: FaceDetectionResult) {
         switch newResult {
         case .noFace:
-            if case .pendingFacePreparedConfirmation = livenessState.state {
-                DispatchQueue.main.async {
-                    self.livenessState.faceNotPrepared(reason: .noFace)
-                }
-            }
+            handleFaceUnavailable(reason: .noFace)
         case .multipleFaces:
-            if case .pendingFacePreparedConfirmation = livenessState.state {
-                DispatchQueue.main.async {
-                    self.livenessState.faceNotPrepared(reason: .multipleFaces)
-                }
-            }
+            handleFaceUnavailable(reason: .multipleFaces)
         case .singleFace(let face):
             guard let sessionConfiguration = sessionConfiguration else { return }
             
@@ -48,9 +40,9 @@ extension FaceLivenessDetectionViewModel: FaceDetectionResultHandler {
             case .pendingFacePreparedConfirmation:
                 if face.faceDistance <= ovalMatchChallenge.face.distanceThreshold {
                         DispatchQueue.main.async {
+                            // frames queued before the first of these ran find the state moved on
+                            guard case .pendingFacePreparedConfirmation = self.livenessState.state else { return }
                             self.livenessState.awaitingRecording()
-                        }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                             self.livenessState.beginRecording()
                         }
                     return
@@ -62,10 +54,7 @@ extension FaceLivenessDetectionViewModel: FaceDetectionResultHandler {
                 }
             case .recording(ovalDisplayed: false):
                 drawOval(onComplete: {
-                    self.sendInitialFaceDetectedEvent(
-                        initialFace: normalizedFace.boundingBox,
-                        videoStartTime: Date().timestampMilliseconds
-                    )
+                    self.sendInitialFaceDetectedEvent(initialFace: normalizedFace.boundingBox)
                 })
             case .recording(ovalDisplayed: true):
                 let instruction = faceInOvalMatching.faceMatchState(
@@ -92,6 +81,33 @@ extension FaceLivenessDetectionViewModel: FaceDetectionResultHandler {
             default: break
 
             }
+        }
+    }
+
+    /// Handles the camera reporting no face (or more than one face) for the current frame.
+    /// The response depends on how far the check has progressed:
+    /// - Before the check is active (`.pendingFacePreparedConfirmation`) we just update the
+    ///   "get ready" instruction, as before.
+    /// - Once the oval is displayed / we're awaiting an oval match, we surface the matching
+    ///   instruction ("Move face in front of camera" / multiple-faces) and keep the oval-fit
+    ///   deadline advancing so the session times out client-side instead of waiting on the
+    ///   service to close the socket.
+    /// - During the freshness (color) check, losing the face doesn't interrupt the colors: the
+    ///   service can't pause and resume a check, so the colors run to the end and the service
+    ///   judges the video.
+    private func handleFaceUnavailable(reason: LivenessStateMachine.FaceNotPreparedReason) {
+        switch livenessState.state {
+        case .pendingFacePreparedConfirmation:
+            DispatchQueue.main.async {
+                self.livenessState.faceNotPrepared(reason: reason)
+            }
+        case .recording(ovalDisplayed: true), .awaitingFaceInOvalMatch:
+            DispatchQueue.main.async {
+                self.livenessState.faceNotMatched(reason: reason)
+                self.handleNoFaceDetected()
+            }
+        default:
+            break
         }
     }
 

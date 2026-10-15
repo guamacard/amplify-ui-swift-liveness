@@ -38,3 +38,4 @@ Tests/IntegrationTestApp/amplifytools.xcconfig
 Tests/IntegrationTestApp/.secret-*
 Tests/IntegrationTestApp/**.sample
 Tests/IntegrationTestApp/*.xcodeproj
+.idea/
